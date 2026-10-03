@@ -19,6 +19,13 @@ then only via a copy — never by closing or driving the running browser.
 3. Save the transcript, and write every `=== FILE:` block to `DS_SAVE_DIR` (basename only).
 4. Read the next step out of the reply itself: a reply ending in
    `INCOMPLETE — continue from scene 04` makes `continue from scene 04` the next prompt.
+
+   **A visible Continue/Retry button outranks a rate-limit verdict**, and rate-limit scanning is scoped to live
+   alert/toast nodes (`ALERT_TEXT`), never `document.body.innerText`: the whole page text includes the
+   conversation, so one "too frequent" line from an earlier reply made every later state look rate-limited and
+   the loop burned its retries instead of clicking the Continue that was on screen (iv1 run, 2026-10-03).
+   `DS_RESUME=1` continues an interrupted chat; a model-emitted `INCOMPLETE` marker can also land *inside* the
+   last saved file block, so strip trailing prose before compiling.
 5. Repeat until the reply asks for nothing (or `DS_FOLLOWUPS` rounds are used).
 
 Step 4 is why no model is needed to decide what to do next — the chat states it in its own

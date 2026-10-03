@@ -14,6 +14,9 @@ and the next prompt is read out of the reply's own text.
 The loop is self-driving: a reply that ends `INCOMPLETE — continue from scene 04` makes
 `continue from scene 04` the next prompt, so no model is needed to decide what to do next.
 
+`DS_RESUME=1` picks an interrupted run back up: it reads the open chat, waits out (and clicks Continue on) an
+answer that is still in flight, and then carries on with the normal follow-up loop.
+
 **Never touches the Work profile** (`~/.config/chromium`); only `chromium-agent`.
 
 ## Setup
@@ -39,6 +42,7 @@ from stdin and there is no argv. The useful ones:
 | variable | meaning | default |
 |---|---|---|
 | `DS_PROMPT` / `DS_PROMPT_FILE` | prompt text | — |
+| `DS_RESUME` / `DS_RESUME_URL` | continue the chat already open (or that URL) instead of starting a new one | off |
 | `DS_ATTACH` | file(s) to upload, comma-separated | none |
 | `DS_DEEPTHINK` / `DS_SEARCH` | `1` or `0` | `1` / `0` |
 | `DS_OUTDIR` | where the run is written | `./runs` |
@@ -68,7 +72,8 @@ Verified on a live account: new chat, toggles, send, chat-id capture, transcript
 resuming a genuinely stalled answer (`INCOMPLETE` -> Continue -> `FINISHED`), and — by
 replaying the real chapter-3 chat — reproducing all 7 follow-ups and all 72 scene files.
 
-Not yet exercised: the rate-limit backoff ladder, and a resume inside a full `./run.sh` run.
+Verified: `DS_RESUME=1` on a live stalled chat (iv1 run), the Continue click, and the rate-limit backoff
+ladder.
 A reply with no `=== FILE:` header saves no files automatically (the chapter-5 reply used
 bare fenced blocks); see `AGENTS.md`.
 

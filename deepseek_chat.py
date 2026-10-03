@@ -91,8 +91,31 @@ def page_text():
     return js("document.body.innerText") or ""
 
 
+# Only *live* banners count as a rate limit. Scanning the whole page text matched the conversation
+# itself — a "too frequent" line from an earlier reply or a toast still in the DOM made every later
+# state look rate-limited, so the loop waited out its retries instead of clicking the Continue
+# button that was plainly on screen (seen in the iv1 run, 2026-10-03).
+ALERT_TEXT = """(() => {
+  const sel = '[role=alert],[class*=toast],[class*=alert],[class*=error],[class*=rate]';
+  let s = '';
+  for (const e of document.querySelectorAll(sel)) {
+    if (e.offsetWidth || e.offsetHeight) s += ' ' + (e.innerText || '');
+  }
+  return s;
+})()"""
+
+
+def alert_text():
+    return js(ALERT_TEXT) or ""
+
+
 def rate_limited():
-    return bool(RATE_RE.search(page_text()))
+    return bool(RATE_RE.search(alert_text()))
+
+
+def resume_control():
+    """The visible Continue/Retry control for a stalled answer, if there is one."""
+    return locator(CONTINUE_RE, 20)
 
 
 def _toggle_js(label, body):
@@ -314,7 +337,11 @@ def wait_for_answer(sid, baseline, cfg):
         sig = json.dumps(msgs, sort_keys=True)
         if sig != last_sig:
             last_sig, last_progress = sig, time.time()
-        if (err and RATE_RE.search(err)) or rate_limited():
+        msg_err = err and RATE_RE.search(err)
+        # A visible Continue/Retry means the answer stalled and can be resumed: click it rather
+        # than treating the state as a rate limit. Clicking is cheap and idempotent, waiting is not.
+        stalled = resume_control()
+        if (msg_err or rate_limited()) and not stalled:
             if not waits_left:
                 raise SystemExit(f"rate limited and out of retries: {err}")
             nap = waits_left.pop(0)
@@ -326,12 +353,10 @@ def wait_for_answer(sid, baseline, cfg):
             say("answer settled")
             return msgs
         # stalled output: resume it by clicking the Continue/Retry control
-        if time.time() - last_progress > cfg["stall_after"] and time.time() >= next_resume_try:
-            next_resume_try = time.time() + 30
-            clicked = None
-            if locator(CONTINUE_RE, 20):
-                wait(cfg["cont_delay"])
-                clicked = click_text(CONTINUE_RE, timeout=3, maxlen=20)
+        if stalled and time.time() >= next_resume_try:
+            next_resume_try = time.time() + 20
+            wait(cfg["cont_delay"])
+            clicked = click_text(CONTINUE_RE, timeout=3, maxlen=20)
             if clicked:
                 say("resumed via:", clicked)
                 last_progress = time.time()
@@ -358,38 +383,67 @@ def main():
     prompt = env("DS_PROMPT", "")
     if not prompt and env("DS_PROMPT_FILE"):
         prompt = pathlib.Path(env("DS_PROMPT_FILE")).read_text()
-    if not prompt and not env("DS_ATTACH"):
-        raise SystemExit("need DS_PROMPT, DS_PROMPT_FILE or DS_ATTACH")
+    resume_url = env("DS_RESUME_URL")
+    resume = bool(resume_url) or env("DS_RESUME", "0") == "1"
+    if not prompt and not env("DS_ATTACH") and not resume:
+        raise SystemExit("need DS_PROMPT, DS_PROMPT_FILE, DS_ATTACH or DS_RESUME")
+
+    sid = None
+    baseline = 0          # assistant messages already present, so rounds cannot be confused
+    skip_send = False
+
+    if resume:
+        # Continue an existing chat instead of starting over: an interrupted run leaves the
+        # chat, its attachments and its partial files on disk, and re-sending the brief wastes it.
+        if resume_url:
+            goto_url(resume_url)
+            wait_for_load()
+            wait(2.0)
+        sid = chat_id_from_url()
+        if not sid:
+            raise SystemExit("resume: the open tab is not a deepseek chat")
+        msgs0, _err = summarize(history(sid))
+        pending = assistant_pending(msgs0)
+        baseline = len(assistant_texts(msgs0)) - (1 if pending else 0)
+        say(f"resuming {sid}: {len(assistant_texts(msgs0))} replies, answer in flight: {pending}")
+        if pending:
+            skip_send = True          # the reply is still coming; wait for it, then follow up
+        else:
+            last = (assistant_texts(msgs0) or [""])[-1]
+            prompt = prompt or next_followup(last) or "continue"
+    else:
+        pass
 
     # 1. fresh chat. The sidebar "New chat" button is hidden when the sidebar is
     #    collapsed (narrow window), but the root URL always opens an empty chat.
-    if "chat.deepseek.com" not in (js("location.href") or ""):
-        new_tab("https://chat.deepseek.com/")
-    goto_url("https://chat.deepseek.com/")
-    wait_for_load()
-    wait(2.5)
-    if "sign_in" in (js("location.href") or ""):
-        raise SystemExit("not logged in on the chromium-agent profile")
-    if js("document.querySelectorAll('.ds-message').length"):
-        raise SystemExit("root URL did not open an empty chat")
-    say("new chat ready")
+    if not resume:
+        if "chat.deepseek.com" not in (js("location.href") or ""):
+            new_tab("https://chat.deepseek.com/")
+        goto_url("https://chat.deepseek.com/")
+        wait_for_load()
+        wait(2.5)
+        if "sign_in" in (js("location.href") or ""):
+            raise SystemExit("not logged in on the chromium-agent profile")
+        if js("document.querySelectorAll('.ds-message').length"):
+            raise SystemExit("root URL did not open an empty chat")
+        say("new chat ready")
 
-    # 2. toggles
-    say("deepthink ->", set_toggle("DeepThink", deepthink))
-    say("search ->", set_toggle("Search", search))
+        # 2. toggles
+        say("deepthink ->", set_toggle("DeepThink", deepthink))
+        say("search ->", set_toggle("Search", search))
 
-    # 3. optional attachments. Files are uploaded rather than pasted because a large
-    #    prompt cannot be sent: the CDP/IPC transport rejects a single oversized frame
-    #    ("Separator is found, but chunk is longer than limit"), so a ~100KB prompt
-    #    cannot reach the composer as text.
-    paths = parse_attach(env("DS_ATTACH"))
-    if paths:
-        missing = [p for p in paths if not os.path.exists(p)]
-        if missing:
-            raise SystemExit("attachment not found: " + ", ".join(missing))
-        upload_file("input[type=file]", paths if len(paths) > 1 else paths[0])
-        wait(3.0)
-        say("attached:", ", ".join(pathlib.Path(p).name for p in paths))
+        # 3. optional attachments. Files are uploaded rather than pasted because a large
+        #    prompt cannot be sent: the CDP/IPC transport rejects a single oversized frame
+        #    ("Separator is found, but chunk is longer than limit"), so a ~100KB prompt
+        #    cannot reach the composer as text.
+        paths = parse_attach(env("DS_ATTACH"))
+        if paths:
+            missing = [p for p in paths if not os.path.exists(p)]
+            if missing:
+                raise SystemExit("attachment not found: " + ", ".join(missing))
+            upload_file("input[type=file]", paths if len(paths) > 1 else paths[0])
+            wait(3.0)
+            say("attached:", ", ".join(pathlib.Path(p).name for p in paths))
 
     # 4. hands-off rounds: send, wait, save files, then obey the reply's own
     #    "INCOMPLETE - continue from X" line until it stops asking.
@@ -397,15 +451,17 @@ def main():
                stall_after=float(env("DS_STALL_AFTER", "45")))
     max_rounds = int(env("DS_FOLLOWUPS", "60"))
 
-    sid = None
-    baseline = 0          # assistant messages already present, so rounds cannot be confused
     rnd = 0
     msgs = []
     prompt = prompt or "continue"       # an attachment-only run still needs a send
     while True:
         rnd += 1
-        say(f"round {rnd}: sending {prompt[:70]!r}")
-        send_prompt(prompt)
+        if skip_send:
+            skip_send = False
+            say(f"round {rnd}: waiting for the reply already in flight")
+        else:
+            say(f"round {rnd}: sending {prompt[:70]!r}")
+            send_prompt(prompt)
         if sid is None:
             deadline = time.time() + 30
             while not sid and time.time() < deadline:
