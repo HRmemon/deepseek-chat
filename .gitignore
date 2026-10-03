@@ -1,0 +1,4 @@
+# run outputs and caches — transcripts are user content, not source
+runs/
+__pycache__/
+*.pyc
