@@ -8,6 +8,9 @@ follow-up and repeat until the work is done.
 Driven through `browser-harness` over CDP. The transcript comes from DeepSeek's own
 `history_messages` API, so thinking and response are already separated — no DOM scraping.
 
+No model is involved anywhere: resume detection is a text match on the Continue/Retry button,
+and the next prompt is read out of the reply's own text.
+
 The loop is self-driving: a reply that ends `INCOMPLETE — continue from scene 04` makes
 `continue from scene 04` the next prompt, so no model is needed to decide what to do next.
 
@@ -45,7 +48,6 @@ from stdin and there is no argv. The useful ones:
 | `DS_CONTINUE_DELAY` | wait before clicking Continue/Retry | `20` |
 | `DS_RATE_WAITS` | rate-limit backoff ladder, seconds | `150,300,300` |
 | `DS_STALL_AFTER` | seconds of no output before trying to resume | `45` |
-| `DS_JEVA` / `DS_JEVA_URL` / `DS_JEVA_MIN_CONF` | decision-model fallback | on / opencode Zen / `0.8` |
 
 ## Output
 

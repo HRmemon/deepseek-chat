@@ -53,9 +53,6 @@ Config is env-only (browser-harness reads the script from stdin, so there is no 
 | `DS_MAX_WAIT` | seconds to wait per reply | `1800` |
 | `DS_CONTINUE_DELAY` | wait before clicking Continue/Retry | `20` |
 | `DS_RATE_WAITS` | rate-limit backoff ladder, seconds | `150,300,300` |
-| `DS_JEVA` | `1`/`0` enable the decision-model fallback | `1` |
-| `DS_JEVA_URL` | decision-model endpoint | opencode Zen `systemone` |
-| `DS_JEVA_MIN_CONF` | confidence below which the model is ignored | `0.8` |
 | `DS_STALL_AFTER` | seconds of no output before trying to resume | `45` |
 
 Output per run: `chat_id.txt`, `transcript.json`, `transcript.md`, plus extracted files.
@@ -115,36 +112,26 @@ on `/home` here. `BU_NAME` must differ from the default daemon, which stays on 9
 Cleanup: `rm -rf ~/.cache/chromium-work-copy` once its chromium is closed.
 - API-level failures surface as `code`/`msg` or `data.biz_code`/`biz_msg`.
 
-## Decision model (Continue/Retry detection)
+## Decision model: deliberately not used
 
-Two interchangeable backends, same `/v1/systemone` wire format — swapping is a URL change:
+An earlier version fell back to a `typesafe`-style decision model (Jev 1.13 free over opencode
+Zen, or local `localdecide`) to pick the resume control when the text match found nothing.
+**The hands-off script does not use it, and it has been removed.** The deterministic path is
+the only path: `locator(CONTINUE_RE)` finds the control by its text and clicks its
+runtime-resolved box.
 
-| backend | URL | auth |
-|---|---|---|
-| Jev 1.13 free (opencode Zen) | `https://opencode.ai/zen/v1/systemone` | `OPENCODE_API_KEY` |
-| localdecide / Laya (local) | `http://127.0.0.1:8791/v1/systemone` | none |
-
-Request `{"model", "state", "questions"}` -> `{"answers": {...}}`. **A `User-Agent` header
-is required** — without one opencode Zen returns 403.
-
-- The `browser-decide` and `decide` skills document this pattern. Contract: the model may
-  only pick the **index of something already observed**; it never returns a selector,
-  coordinate, or text. `visible_controls()` builds the table, `resolve_choice()` maps the
-  answer back, and an out-of-range index is treated as no answer.
-- **The confidence gate is load-bearing.** Measured against jev-1.13-free: with a real
-  resume control present it picks it at 0.99, but with *no* resume control on screen it
-  invents one (`ok` at 0.29, `DeepThink` at 0.66). Without a gate the automation clicks
-  random buttons. `test_stall_gate.py` pins this behaviour.
-- `localdecide` itself is currently unusable on this machine: `localdecide doctor` fails
-  with `FileNotFoundError: Subfolder 'v10s' not found in 'cklxx/laya-browser'` (upstream
-  checkpoint layout moved). Jev-free is the working backend until that is fixed.
-- `DS_JEVA=0` disables the model entirely; the deterministic fast path
-  (`CONTINUE_RE` + runtime-resolved click) is tried first either way.
+If it is ever reconsidered, the measured facts are: both backends speak
+`POST <base>/systemone` with `{"model", "state", "questions"}`; opencode Zen **rejects a
+request with no `User-Agent`** (403); the model picks a real resume control at 0.99 confidence
+but **invents one when none exists** (0.29 and 0.66 were observed), so a confidence gate of
+~0.8 is mandatory. Without the gate it clicks arbitrary buttons. Also note `localdecide` was
+broken on this machine — `localdecide doctor` fails with
+`FileNotFoundError: Subfolder 'v10s' not found in 'cklxx/laya-browser'` because the upstream
+repo was flattened on 2026-09-29.
 
 ## Open items
 
 - The rate-limit backoff path has not been triggered end-to-end.
-- `localdecide` checkpoint fetch is broken (see above).
 - Resume was verified live on a real stalled chat through `wait_for_answer()` (the function
   `main()` uses): `INCOMPLETE` -> clicked Continue -> `FINISHED`, no navigation. It has still
   not been exercised inside a full `./run.sh` run, which opens a new chat and would need that

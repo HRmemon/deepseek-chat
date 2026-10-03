@@ -1,12 +1,11 @@
 """Regression checks for the hands-off loop: what to send next, and where files land.
 
-Two risks worth pinning without a browser:
-  1. The decision model confabulates a control when none resumes the answer, so the
-     confidence gate must reject it. If it lets one through, the automation clicks a
-     random button. These are actual answers observed from jev-1.13-free.
-  2. The reply's own "INCOMPLETE - continue from X" line becomes the next prompt, and
-     the `=== FILE:` paths in a reply are model output, so they must never be able to
-     write outside the save directory.
+No browser, no network, no model. Two things worth pinning:
+  1. The reply's own "INCOMPLETE - continue from X" line becomes the next prompt, and the
+     detection must be anchored — a code comment that merely mentions INCOMPLETE must not
+     trigger a follow-up, and a reply that is finished must not either.
+  2. The `=== FILE:` paths in a reply are model output, so they must never be able to write
+     outside the save directory.
 """
 import os
 
@@ -21,26 +20,8 @@ spec = importlib.util.spec_from_file_location(
 ds = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ds)
 
-# --- confidence gate ---------------------------------------------------------
-CONTROLS = [{"index": 0, "label": "ok"}, {"index": 1, "label": "Copy"},
-            {"index": 2, "label": "Continue"}, {"index": 3, "label": "Regenerate"}]
-MIN_CONF = 0.8
-
-
-def answer(choice, confidence):
-    return {"action": {"type": "choice", "choice": choice, "confidence": confidence}}
-
-
-assert ds.resolve_choice(answer("2", 0.99), CONTROLS, MIN_CONF) == "Continue"
-assert ds.resolve_choice(answer("0", 0.29), CONTROLS, MIN_CONF) is None   # confabulated
-assert ds.resolve_choice(answer("3", 0.66), CONTROLS, MIN_CONF) is None   # confabulated
-assert ds.resolve_choice(answer("none", 1.0), CONTROLS, MIN_CONF) is None
-assert ds.resolve_choice(answer("9", 1.0), CONTROLS, MIN_CONF) is None
-assert ds.resolve_choice(None, CONTROLS, MIN_CONF) is None
-assert ds.resolve_choice({}, CONTROLS, MIN_CONF) is None
-
 # --- what to send next -------------------------------------------------------
-# The exact tails of the eight real replies in the DDIA chapter-3 chat.
+# The exact tails of the real replies in the DDIA chapter-3 chat.
 for marker, expected in [
     ("INCOMPLETE \u2014 continue from scene 04", "continue from scene 04"),
     ("INCOMPLETE \u2013 continue from scene 51", "continue from scene 51"),
@@ -55,6 +36,7 @@ assert ds.next_followup(None) is None
 assert ds.next_followup("some text\n\nINCOMPLETE") == "continue"
 # the word appearing earlier in a code comment must not trigger a follow-up
 assert ds.next_followup("# INCOMPLETE handling\nprint(1)\n") is None
+assert ds.next_followup("INCOMPLETE - continue from scene 04\nprint(1)\n") is None
 
 # --- file blocks -------------------------------------------------------------
 SAMPLE = (
@@ -83,4 +65,4 @@ with tempfile.TemporaryDirectory() as tmp:
                                 pathlib.Path(tmp))
     assert again == [], again
 
-print("ok: confidence gate, follow-up detection and file saving all behave")
+print("ok: follow-up detection and file saving behave")

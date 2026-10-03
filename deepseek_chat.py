@@ -23,7 +23,6 @@ import os
 import pathlib
 import re
 import time
-import urllib.request
 
 RATE_RE = re.compile(
     r"too frequent|too many|rate.?limit|try again later|please wait|"
@@ -194,95 +193,6 @@ def chat_id_from_url():
     return m.group(1) if m else None
 
 
-# ------------------------------------------------------- decision model fallback
-# Optional. Used only when the deterministic checks find no resume control.
-# Both endpoints speak the same /v1/systemone wire format, so it is a URL swap:
-#   jev-1.13-free  https://opencode.ai/zen/v1/systemone   (needs OPENCODE_API_KEY)
-#   localdecide    http://127.0.0.1:8791/v1/systemone     (local Laya, no key)
-# See the browser-decide / decide skills for the contract: the model picks an index
-# of something we observed. It never returns a selector, coordinate, or text.
-
-def jev(state, questions, model="jev-1.13-free", timeout=20):
-    url = env("DS_JEVA_URL", "https://opencode.ai/zen/v1/systemone")
-    headers = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
-    key = os.environ.get("OPENCODE_API_KEY")
-    if key and "opencode.ai" in url:
-        headers["Authorization"] = "Bearer " + key
-    body = json.dumps({"model": model, "state": state, "questions": questions}).encode()
-    req = urllib.request.Request(url, data=body, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.load(r).get("answers")
-    except Exception as e:
-        say("decision model unavailable:", e)
-        return None
-
-
-def visible_controls(maxlen=30, limit=20):
-    """[{index, label, role}] for visible clickable controls. Indices are the contract."""
-    return js(f"""(() => {{
-      const seen = new Set(), out = [];
-      for (const e of document.querySelectorAll('button,[role=button],[tabindex],a')) {{
-        const label = (e.innerText || '').trim().replace(/\\s+/g, ' ');
-        if (!label || label.length > {maxlen}) continue;
-        const r = e.getBoundingClientRect();
-        if (r.width === 0 || r.height === 0) continue;
-        if (seen.has(label)) continue;
-        seen.add(label);
-        out.push({{index: out.length, label: label, role: e.getAttribute('role') || e.tagName.toLowerCase()}});
-      }}
-      return out.slice(0, {limit});
-    }})()""") or []
-
-
-def resolve_choice(ans, controls, min_conf):
-    """Pure: a decision-model answer -> control label, or None when unsure / out of range.
-
-    The model reliably picks the right control when one exists (conf ~0.99) but
-    confabulates one when none does (measured 0.29 and 0.66), so confidence is a
-    required gate, not a nicety. It also may only reference an index we listed.
-    """
-    action = (ans or {}).get("action") or {}
-    if (action.get("confidence") or 0) < min_conf:
-        return None
-    choice = str(action.get("choice", ""))
-    if not choice.isdigit():
-        return None
-    idx = int(choice)
-    return controls[idx]["label"] if 0 <= idx < len(controls) else None
-
-
-def jev_pick_resume(msgs):
-    """Ask the decision model which observed control resumes a stalled answer.
-    Returns the label of the chosen control, resolved back from its index."""
-    controls = visible_controls()
-    if not controls:
-        return None
-    last = next((m for m in reversed(msgs) if m.get("role") == "ASSISTANT"), {})
-    state = {
-        "url": js("location.href"),
-        "assistant_status": last.get("status"),
-        "auto_continue": last.get("auto_continue"),
-        "has_pending_fragment": last.get("has_pending_fragment"),
-        "incomplete_message": str(last.get("incomplete_message"))[:200],
-        "controls": controls,
-        "page_text_tail": (page_text() or "")[-600:],
-    }
-    criteria = {str(c["index"]): f"[{c['index']}] {c['label']} ({c['role']})" for c in controls}
-    criteria["none"] = "No listed control resumes the answer"
-    ans = jev(state, {"action": {
-        "type": "choice",
-        "instructions": ("The DeepSeek answer looks stalled. Which listed control resumes "
-                         "it? Answer with its number, or 'none'."),
-        "criteria": criteria}})
-    if not ans:
-        return None
-    label = resolve_choice(ans, controls, float(env("DS_JEVA_MIN_CONF", "0.8")))
-    if not label:
-        say(f"decision model unsure: {json.dumps((ans.get('action') or {}))[:120]}")
-    return label
-
-
 # ---------------------------------------------------------------- transcript
 
 def render_markdown(msgs):
@@ -408,18 +318,13 @@ def wait_for_answer(sid, baseline, cfg):
         if len(assistant_texts(msgs)) > baseline and not assistant_pending(msgs):
             say("answer settled")
             return msgs
-        # stalled output: resume it. Fixed labels first, then ask the decision model.
+        # stalled output: resume it by clicking the Continue/Retry control
         if time.time() - last_progress > cfg["stall_after"] and time.time() >= next_resume_try:
             next_resume_try = time.time() + 30
             clicked = None
             if locator(CONTINUE_RE, 20):
+                wait(cfg["cont_delay"])
                 clicked = click_text(CONTINUE_RE, timeout=3, maxlen=20)
-            elif cfg["use_jev"]:
-                label = jev_pick_resume(msgs)
-                if label:
-                    say(f"decision model picked {label!r}; waiting {cfg['cont_delay']:.0f}s")
-                    wait(cfg["cont_delay"])
-                    clicked = click_text("^" + re.escape(label) + "$", timeout=5, maxlen=30)
             if clicked:
                 say("resumed via:", clicked)
                 last_progress = time.time()
@@ -476,8 +381,7 @@ def main():
     # 4. hands-off rounds: send, wait, save files, then obey the reply's own
     #    "INCOMPLETE - continue from X" line until it stops asking.
     cfg = dict(max_wait=max_wait, cont_delay=cont_delay, rate_waits=rate_waits,
-               stall_after=float(env("DS_STALL_AFTER", "45")),
-               use_jev=env("DS_JEVA", "1") == "1")
+               stall_after=float(env("DS_STALL_AFTER", "45")))
     max_rounds = int(env("DS_FOLLOWUPS", "60"))
 
     sid = None
