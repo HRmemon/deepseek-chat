@@ -65,4 +65,13 @@ with tempfile.TemporaryDirectory() as tmp:
                                 pathlib.Path(tmp))
     assert again == [], again
 
+# --- attachments -------------------------------------------------------------
+# comma-separated, blanks ignored, resolved to absolute paths
+got = ds.parse_attach(" a.md , b.md ")
+assert [pathlib.Path(g).name for g in got] == ["a.md", "b.md"], got
+assert all(pathlib.Path(g).is_absolute() for g in got), got
+assert ds.parse_attach("a.md,") == [str(pathlib.Path("a.md").resolve())]
+assert ds.parse_attach("") == [] and ds.parse_attach(None) == []
+assert len(ds.parse_attach("a.md,b.md,c.md,d.md")) == 4
+
 print("ok: follow-up detection and file saving behave")

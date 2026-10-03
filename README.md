@@ -30,7 +30,7 @@ idempotent; it does nothing if the profile is already running.
 ```bash
 DS_PROMPT='Explain the CAP theorem' ./run.sh
 
-DS_PROMPT_FILE=prompt.md DS_ATTACH=paper.pdf DS_DEEPTHINK=1 DS_SEARCH=0 ./run.sh
+DS_PROMPT_FILE=prompt.md DS_ATTACH=a.pdf,b.md DS_DEEPTHINK=1 DS_SEARCH=0 ./run.sh
 ```
 
 All configuration is environment variables, because `browser-harness` reads the script
@@ -39,7 +39,7 @@ from stdin and there is no argv. The useful ones:
 | variable | meaning | default |
 |---|---|---|
 | `DS_PROMPT` / `DS_PROMPT_FILE` | prompt text | — |
-| `DS_ATTACH` | file to upload into the chat | none |
+| `DS_ATTACH` | file(s) to upload, comma-separated | none |
 | `DS_DEEPTHINK` / `DS_SEARCH` | `1` or `0` | `1` / `0` |
 | `DS_OUTDIR` | where the run is written | `./runs` |
 | `DS_SAVE_DIR` | where returned `=== FILE:` blocks land | `<outdir>/files` |

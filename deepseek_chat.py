@@ -7,7 +7,7 @@
 #
 # Config (env):
 #   DS_PROMPT        prompt text            (or DS_PROMPT_FILE = path)
-#   DS_ATTACH        optional file to upload in the chat
+#   DS_ATTACH        file(s) to upload, comma-separated; avoids pasting a huge prompt
 #   DS_DEEPTHINK     1/0  (default 1)
 #   DS_SEARCH        1/0  (default 0)
 #   DS_OUTDIR        default ./runs
@@ -263,6 +263,13 @@ def parse_file_blocks(text):
             for i in range(1, len(parts) - 1, 2)]
 
 
+def parse_attach(value):
+    """DS_ATTACH -> [absolute paths]. Comma-separated, so several files can go in one send.
+    Blank entries are dropped, so a trailing comma is harmless."""
+    return [str(pathlib.Path(p.strip()).resolve())
+            for p in (value or "").split(",") if p.strip()]
+
+
 def save_file_blocks(msgs, savedir):
     """Write every `=== FILE:` block under its basename in `savedir`.
 
@@ -371,12 +378,18 @@ def main():
     say("deepthink ->", set_toggle("DeepThink", deepthink))
     say("search ->", set_toggle("Search", search))
 
-    # 3. optional attachment
-    attach = env("DS_ATTACH")
-    if attach:
-        upload_file("input[type=file]", str(pathlib.Path(attach).resolve()))
+    # 3. optional attachments. Files are uploaded rather than pasted because a large
+    #    prompt cannot be sent: the CDP/IPC transport rejects a single oversized frame
+    #    ("Separator is found, but chunk is longer than limit"), so a ~100KB prompt
+    #    cannot reach the composer as text.
+    paths = parse_attach(env("DS_ATTACH"))
+    if paths:
+        missing = [p for p in paths if not os.path.exists(p)]
+        if missing:
+            raise SystemExit("attachment not found: " + ", ".join(missing))
+        upload_file("input[type=file]", paths if len(paths) > 1 else paths[0])
         wait(3.0)
-        say("attached:", pathlib.Path(attach).name)
+        say("attached:", ", ".join(pathlib.Path(p).name for p in paths))
 
     # 4. hands-off rounds: send, wait, save files, then obey the reply's own
     #    "INCOMPLETE - continue from X" line until it stops asking.

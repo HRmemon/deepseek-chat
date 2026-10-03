@@ -44,7 +44,7 @@ Config is env-only (browser-harness reads the script from stdin, so there is no 
 | var | meaning | default |
 |---|---|---|
 | `DS_PROMPT` / `DS_PROMPT_FILE` | prompt text | — |
-| `DS_ATTACH` | file to upload into the chat | none |
+| `DS_ATTACH` | file(s) to upload, comma-separated | none |
 | `DS_DEEPTHINK` | `1`/`0` | `1` |
 | `DS_SEARCH` | `1`/`0` | `0` |
 | `DS_OUTDIR` | output dir | `./runs` |
@@ -128,6 +128,18 @@ but **invents one when none exists** (0.29 and 0.66 were observed), so a confide
 broken on this machine — `localdecide doctor` fails with
 `FileNotFoundError: Subfolder 'v10s' not found in 'cklxx/laya-browser'` because the upstream
 repo was flattened on 2026-09-29.
+
+## Known limits
+
+- **A large prompt cannot be pasted into the composer.** `set_composer` pushes the whole text
+  through one `Runtime.evaluate`, and the CDP/IPC transport rejects an oversized frame:
+  `RuntimeError: Separator is found, but chunk is longer than limit`. A ~98KB prompt fails.
+  Workaround, and the way the DDIA runs are done: upload the prompt files and send short text
+  naming them (`DS_ATTACH=a.md,b.md`). `DOM.setFileInputFiles` carries the paths, not the
+  contents, so size is irrelevant. Chunking `set_composer` (assemble the text in a page global
+  across several small evaluates, then set the value once) is the fix if pasting is needed.
+- Resume detection only looks for the Continue/Retry control by text. There is no fallback, by
+  design.
 
 ## Open items
 
