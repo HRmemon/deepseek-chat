@@ -1,7 +1,9 @@
 # DeepSeek chat automation. Run with ./run.sh (this file is fed to browser-harness on stdin).
 #
-# Does: new chat -> optional file attach -> toggles -> type+send prompt -> wait,
-# clicking any Continue/Retry button -> rate-limit backoff -> save transcript.
+# Hands-off loop: new chat -> optional attach -> toggles -> send -> wait (resuming a stalled
+# answer by clicking Continue/Retry) -> save any `=== FILE:` blocks to disk -> read the reply's
+# own "INCOMPLETE - continue from X" instruction and send it as the next prompt -> repeat until
+# the reply stops asking, then write the transcript.
 #
 # Config (env):
 #   DS_PROMPT        prompt text            (or DS_PROMPT_FILE = path)
@@ -9,11 +11,13 @@
 #   DS_DEEPTHINK     1/0  (default 1)
 #   DS_SEARCH        1/0  (default 0)
 #   DS_OUTDIR        default ./runs
-#   DS_MAX_WAIT      seconds before giving up (default 1800)
+#   DS_SAVE_DIR      where `=== FILE:` blocks land (default <outdir>/files)
+#   DS_FOLLOWUPS     max auto follow-ups before stopping (default 60)
+#   DS_MAX_WAIT      seconds to wait per reply (default 1800)
 #   DS_CONTINUE_DELAY  seconds to wait before clicking Continue/Retry (default 20)
 #   DS_RATE_WAITS    comma list of backoff seconds (default 150,300,300)
+#   DS_STALL_AFTER   seconds of no output before trying to resume (default 45)
 
-import datetime
 import json
 import os
 import pathlib
@@ -25,7 +29,13 @@ RATE_RE = re.compile(
     r"too frequent|too many|rate.?limit|try again later|please wait|"
     r"\u7e41\u7406|\u592a\u9891\u7e41|\u7a0d\u540e", re.I)
 CONTINUE_RE = r"^(continue|retry|try again|regenerate|resume)$"
-CONTINUE_BUTTON_RE = re.compile(CONTINUE_RE, re.I)
+# DeepSeek marks a cut-off reply in its own text, e.g. "INCOMPLETE - continue from scene 04".
+# That line is the next instruction, so the loop needs no model to decide what to do.
+# Anchored to a line start and the end of the reply, so a code comment that merely mentions
+# INCOMPLETE cannot fake a follow-up.
+INCOMPLETE_RE = re.compile(r"^INCOMPLETE\s*[\u2014\u2013-]\s*(.+?)\s*\Z", re.M)
+BARE_INCOMPLETE_RE = re.compile(r"INCOMPLETE[^\w]*\Z")
+FILE_RE = re.compile(r"^=== FILE:\s*(.+?)\s*$", re.M)   # no closing === on the real files
 
 
 def say(*a):
@@ -303,10 +313,130 @@ def save_run(sid, msgs, outdir):
     return outdir
 
 
+# ------------------------------------------------------------------ loop pieces
+
+def assistant_texts(msgs):
+    """Every RESPONSE fragment of every assistant message, in order."""
+    return ["".join(f.get("content") or "" for f in m.get("fragments") or []
+                    if (f.get("type") or "").upper() == "RESPONSE")
+            for m in msgs if m.get("role") == "ASSISTANT"]
+
+
+def next_followup(text):
+    """The reply states its own next step, e.g. 'INCOMPLETE - continue from scene 04'.
+
+    Returns the part after the dash, which is exactly the message the chat expects next.
+    """
+    text = (text or "").rstrip()
+    if not text:
+        return None
+    m = INCOMPLETE_RE.search(text)
+    if m:
+        return m.group(1).strip()
+    if BARE_INCOMPLETE_RE.search(text.splitlines()[-1]):
+        return "continue"
+    return None
+
+
+def strip_fence(block):
+    lines = block.strip("\n").split("\n")
+    if lines and lines[0].lstrip().startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def parse_file_blocks(text):
+    parts = FILE_RE.split(text or "")
+    return [(parts[i].strip(), strip_fence(parts[i + 1]))
+            for i in range(1, len(parts) - 1, 2)]
+
+
+def save_file_blocks(msgs, savedir):
+    """Write every `=== FILE:` block under its basename in `savedir`.
+
+    Basename only, on purpose: the declared path is model output, so it must not be able
+    to write anywhere on disk by itself. Copy files out of savedir when they look right.
+    """
+    written = []
+    for text in assistant_texts(msgs):
+        for declared, body in parse_file_blocks(text):
+            p = savedir / pathlib.Path(declared).name
+            if p.exists() and p.read_text() == body:
+                continue
+            savedir.mkdir(parents=True, exist_ok=True)
+            p.write_text(body)
+            written.append(p)
+    return written
+
+
+def send_prompt(text):
+    set_composer(text)
+    wait(0.3)
+    if not js("document.querySelector('textarea').value.length"):
+        raise RuntimeError("prompt did not land in the composer")
+    if not click_send():
+        click_text(r"send", timeout=3)
+
+
+def wait_for_answer(sid, baseline, cfg):
+    """Wait for one reply: resume stalls, back off on rate limits, return the messages.
+
+    `baseline` is the number of assistant messages already present, so a previous round's
+    finished reply is never mistaken for this round's answer.
+    """
+    started = time.time()
+    waits_left = list(cfg["rate_waits"])
+    last_sig = None
+    last_progress = time.time()
+    next_resume_try = 0.0
+    msgs = []
+    while time.time() - started < cfg["max_wait"]:
+        msgs, err = summarize(history(sid))
+        sig = json.dumps(msgs, sort_keys=True)
+        if sig != last_sig:
+            last_sig, last_progress = sig, time.time()
+        if (err and RATE_RE.search(err)) or rate_limited():
+            if not waits_left:
+                raise SystemExit(f"rate limited and out of retries: {err}")
+            nap = waits_left.pop(0)
+            say(f"rate limited; waiting {nap:.0f}s ({len(waits_left)} retries left)")
+            wait(nap)
+            last_progress = time.time()
+            continue
+        if len(assistant_texts(msgs)) > baseline and not assistant_pending(msgs):
+            say("answer settled")
+            return msgs
+        # stalled output: resume it. Fixed labels first, then ask the decision model.
+        if time.time() - last_progress > cfg["stall_after"] and time.time() >= next_resume_try:
+            next_resume_try = time.time() + 30
+            clicked = None
+            if locator(CONTINUE_RE, 20):
+                clicked = click_text(CONTINUE_RE, timeout=3, maxlen=20)
+            elif cfg["use_jev"]:
+                label = jev_pick_resume(msgs)
+                if label:
+                    say(f"decision model picked {label!r}; waiting {cfg['cont_delay']:.0f}s")
+                    wait(cfg["cont_delay"])
+                    clicked = click_text("^" + re.escape(label) + "$", timeout=5, maxlen=30)
+            if clicked:
+                say("resumed via:", clicked)
+                last_progress = time.time()
+                wait(3.0)
+                continue
+        if int(time.time() - started) % 15 < 4:
+            say(f"...waiting ({int(time.time()-started)}s)")
+        wait(3.0)
+    say(f"max wait {cfg['max_wait']:.0f}s reached")
+    return msgs
+
+
 # ---------------------------------------------------------------- main
 
 def main():
     outdir = pathlib.Path(env("DS_OUTDIR", str(pathlib.Path.cwd() / "runs")))
+    savedir = pathlib.Path(env("DS_SAVE_DIR", str(outdir / "files")))
     max_wait = float(env("DS_MAX_WAIT", "1800"))
     cont_delay = float(env("DS_CONTINUE_DELAY", "20"))
     rate_waits = [float(x) for x in env("DS_RATE_WAITS", "150,300,300").split(",")]
@@ -343,80 +473,56 @@ def main():
         wait(3.0)
         say("attached:", pathlib.Path(attach).name)
 
-    # 4. prompt + send
-    set_composer(prompt)
-    wait(0.3)
-    if not js("document.querySelector('textarea').value.length"):
-        raise SystemExit("prompt did not land in the composer")
-    if not click_send():
-        click_text(r"send", timeout=3)
-    say("sent")
+    # 4. hands-off rounds: send, wait, save files, then obey the reply's own
+    #    "INCOMPLETE - continue from X" line until it stops asking.
+    cfg = dict(max_wait=max_wait, cont_delay=cont_delay, rate_waits=rate_waits,
+               stall_after=float(env("DS_STALL_AFTER", "45")),
+               use_jev=env("DS_JEVA", "1") == "1")
+    max_rounds = int(env("DS_FOLLOWUPS", "60"))
 
-    # 5. wait for the chat id to appear in the URL
-    deadline = time.time() + 30
     sid = None
-    while not sid and time.time() < deadline:
-        wait(1.0)
-        sid = chat_id_from_url()
-    if not sid:
-        raise SystemExit("no chat id in URL after send")
-    say("chat id:", sid)
+    baseline = 0          # assistant messages already present, so rounds cannot be confused
+    rnd = 0
+    msgs = []
+    prompt = prompt or "continue"       # an attachment-only run still needs a send
+    while True:
+        rnd += 1
+        say(f"round {rnd}: sending {prompt[:70]!r}")
+        send_prompt(prompt)
+        if sid is None:
+            deadline = time.time() + 30
+            while not sid and time.time() < deadline:
+                wait(1.0)
+                sid = chat_id_from_url()
+            if not sid:
+                raise SystemExit("no chat id in URL after send")
+            say("chat id:", sid)
 
-    # 6. wait for the answer, handling continue-buttons and rate limits
-    started = time.time()
-    waits_left = list(rate_waits)
-    last_sig = None
-    last_progress = time.time()
-    next_resume_try = 0.0
-    stall_after = float(env("DS_STALL_AFTER", "45"))
-    use_jev = env("DS_JEVA", "1") == "1"
-    while time.time() - started < max_wait:
-        msgs, err = summarize(history(sid))
-        sig = json.dumps(msgs, sort_keys=True)
-        if sig != last_sig:
-            last_sig, last_progress = sig, time.time()
-        if (err and RATE_RE.search(err)) or rate_limited():
-            if not waits_left:
-                raise SystemExit(f"rate limited and out of retries: {err}")
-            nap = waits_left.pop(0)
-            say(f"rate limited; waiting {nap:.0f}s ({len(waits_left)} retries left)")
-            wait(nap)
-            last_progress = time.time()
-            continue
-        if (msgs and any(m.get("role") == "ASSISTANT" for m in msgs)
-                and not assistant_pending(msgs)):
-            say("finished")
+        msgs = wait_for_answer(sid, baseline, cfg)
+        if not msgs:
+            raise SystemExit("no transcript returned")
+        baseline = len(assistant_texts(msgs))
+        save_run(sid, msgs, outdir)
+        written = save_file_blocks(msgs, savedir)
+        if written:
+            say(f"round {rnd}: saved {len(written)} file(s) ->", savedir)
+
+        texts = assistant_texts(msgs)
+        nxt = next_followup(texts[-1]) if texts else None
+        if not nxt:
+            say("reply is complete; nothing to follow up")
             break
-        # stalled output: resume it. Fixed labels first, then ask Jev.
-        stalled = time.time() - last_progress > stall_after
-        if stalled and time.time() >= next_resume_try:
-            next_resume_try = time.time() + 30
-            target = re.search(CONTINUE_RE, page_text() or "") and CONTINUE_RE
-            clicked = None
-            if target and locator(CONTINUE_RE, 20):
-                clicked = click_text(CONTINUE_RE, timeout=3, maxlen=20)
-            elif use_jev:
-                label = jev_pick_resume(msgs)
-                if label:
-                    say(f"decision model picked {label!r}; waiting {cont_delay:.0f}s")
-                    wait(cont_delay)
-                    clicked = click_text("^" + re.escape(label) + "$", timeout=5, maxlen=30)
-            if clicked:
-                say("resumed via:", clicked)
-                last_progress = time.time()
-                wait(3.0)
-                continue
-        if int(time.time() - started) % 15 < 4:
-            say(f"...waiting ({int(time.time()-started)}s)")
-        wait(3.0)
-    else:
-        say("max wait reached")
+        if rnd > max_rounds:
+            say(f"follow-up limit ({max_rounds}) reached; stopping")
+            break
+        prompt = nxt
+        say(f"auto follow-up: {nxt!r}")
 
-    msgs, err = summarize(history(sid))
-    if not msgs:
-        raise SystemExit(f"no transcript: {err or 'unknown error'}")
     d = save_run(sid, msgs, outdir)
-    say("saved:", d / "transcript.md")
+    say(f"done after {rnd} round(s)")
+    say("chat id:", sid)
+    say("transcript:", d / "transcript.md")
+    say("files:", savedir)
 # browser-harness execs this file inside its own module, so __name__ is never
 # "__main__" here. Use an explicit opt-out so tests can import without running a chat.
 if os.environ.get("DS_IMPORT_ONLY") != "1":
