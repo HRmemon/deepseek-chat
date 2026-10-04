@@ -17,6 +17,7 @@
 #   DS_CONTINUE_DELAY  seconds to wait before clicking Continue/Retry (default 20)
 #   DS_RATE_WAITS    comma list of backoff seconds (default 150,300,300)
 #   DS_STALL_AFTER   seconds of no output before trying to resume (default 45)
+#   DS_STABLE_S      seconds the reply text must stay unchanged before it counts as complete (default 4)
 
 import json
 import os
@@ -211,6 +212,47 @@ def assistant_pending(msgs):
     return True
 
 
+# --------------------------------------------------------------- DOM stability
+# `assistant_pending` reads the page's own API, which is the authoritative "still streaming?"
+# signal. This adds the second, independent one: how long the rendered reply text has gone
+# unchanged. Both must agree before a reply counts as complete, because the API can flip to
+# FINISHED a beat before the last fragment lands in the DOM.
+OBSERVER_JS = """(() => {
+  if (window.__dsObs) return true;
+  const o = {changed: Date.now(), len: 0};
+  window.__dsObs = o;
+  const arm = () => {
+    const nodes = document.querySelectorAll('.ds-message');
+    const last = nodes[nodes.length - 1];
+    if (!last || last.__dsWatch) return;
+    last.__dsWatch = true;
+    new MutationObserver(() => { o.changed = Date.now(); o.len = (last.innerText || '').length; })
+      .observe(last, {childList: true, subtree: true, characterData: true});
+    o.changed = Date.now();
+    o.len = (last.innerText || '').length;
+  };
+  window.__dsArm = arm;
+  arm();
+  setInterval(arm, 1000);   // a new reply becomes the watched node
+  return true;
+})()"""
+
+
+def dom_state():
+    """-> {'age': seconds since the reply text last changed, 'len': chars} or None."""
+    st = js("""(() => {
+      const o = window.__dsObs;
+      return o ? {age: (Date.now() - o.changed) / 1000, len: o.len} : null;
+    })()""")
+    if not st:
+        js(OBSERVER_JS)
+        st = js("""(() => {
+          const o = window.__dsObs;
+          return o ? {age: (Date.now() - o.changed) / 1000, len: o.len} : null;
+        })()""")
+    return st
+
+
 def chat_id_from_url():
     m = re.search(r"/a/chat/s/([0-9a-f-]{36})", js("location.href") or "")
     return m.group(1) if m else None
@@ -350,8 +392,13 @@ def wait_for_answer(sid, baseline, cfg):
             last_progress = time.time()
             continue
         if len(assistant_texts(msgs)) > baseline and not assistant_pending(msgs):
-            say("answer settled")
-            return msgs
+            st = dom_state()
+            if not st:
+                say("no reply node to watch; trusting the API")
+                return msgs
+            if st["age"] >= cfg["stable_s"]:
+                say(f"answer settled (reply text quiet {st['age']:.1f}s, {st['len']} chars)")
+                return msgs
         # stalled output: resume it by clicking the Continue/Retry control
         if stalled and time.time() >= next_resume_try:
             next_resume_try = time.time() + 20
@@ -432,23 +479,25 @@ def main():
         say("deepthink ->", set_toggle("DeepThink", deepthink))
         say("search ->", set_toggle("Search", search))
 
-        # 3. optional attachments. Files are uploaded rather than pasted because a large
-        #    prompt cannot be sent: the CDP/IPC transport rejects a single oversized frame
-        #    ("Separator is found, but chunk is longer than limit"), so a ~100KB prompt
-        #    cannot reach the composer as text.
-        paths = parse_attach(env("DS_ATTACH"))
-        if paths:
-            missing = [p for p in paths if not os.path.exists(p)]
-            if missing:
-                raise SystemExit("attachment not found: " + ", ".join(missing))
-            upload_file("input[type=file]", paths if len(paths) > 1 else paths[0])
-            wait(3.0)
-            say("attached:", ", ".join(pathlib.Path(p).name for p in paths))
+    # 3. optional attachments. Files are uploaded rather than pasted because a large prompt
+    #    cannot be sent: the CDP/IPC transport rejects a single oversized frame ("Separator is
+    #    found, but chunk is longer than limit"), so a ~100KB prompt cannot reach the composer
+    #    as text. Works on resume too, which is how a later stage's brief joins a live chat.
+    paths = parse_attach(env("DS_ATTACH"))
+    if paths:
+        missing = [p for p in paths if not os.path.exists(p)]
+        if missing:
+            raise SystemExit("attachment not found: " + ", ".join(missing))
+        upload_file("input[type=file]", paths if len(paths) > 1 else paths[0])
+        wait(3.0)
+        say("attached:", ", ".join(pathlib.Path(p).name for p in paths))
 
+    js(OBSERVER_JS)   # watch the reply text, so "complete" needs API and DOM to agree
     # 4. hands-off rounds: send, wait, save files, then obey the reply's own
     #    "INCOMPLETE - continue from X" line until it stops asking.
     cfg = dict(max_wait=max_wait, cont_delay=cont_delay, rate_waits=rate_waits,
-               stall_after=float(env("DS_STALL_AFTER", "45")))
+               stall_after=float(env("DS_STALL_AFTER", "45")),
+               stable_s=float(env("DS_STABLE_S", "4")))
     max_rounds = int(env("DS_FOLLOWUPS", "60"))
 
     rnd = 0
