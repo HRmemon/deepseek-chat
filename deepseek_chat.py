@@ -18,6 +18,12 @@
 #   DS_RATE_WAITS    comma list of backoff seconds (default 150,300,300)
 #   DS_STALL_AFTER   seconds of no output before trying to resume (default 45)
 #   DS_STABLE_S      seconds the reply text must stay unchanged before it counts as complete (default 4)
+#   DS_TOTAL_WAIT    overall seconds for the whole output before giving up, exit 2 (default 21600)
+#   DS_CONTINUE_PROMPT  text sent when a reply stops without a COMPLETE line (default "continue")
+#
+# The run ends only when a reply ends with "COMPLETE — ...". A reply that stops early without
+# either terminator gets another continue, so a dropped tail costs a round, not the whole output.
+# Watch progress with <DS_OUTDIR>/state.json.
 
 import json
 import os
@@ -35,6 +41,10 @@ CONTINUE_RE = r"^(continue|retry|try again|regenerate|resume)$"
 # INCOMPLETE cannot fake a follow-up.
 INCOMPLETE_RE = re.compile(r"^INCOMPLETE\s*[\u2014\u2013-]\s*(.+?)\s*\Z", re.M)
 BARE_INCOMPLETE_RE = re.compile(r"INCOMPLETE[^\w]*\Z")
+# The other half of the contract: the reply says when the OUTPUT is done, e.g. "COMPLETE - 42 scenes".
+# Only that line ends the run. A reply that merely stops is cut off and gets another continue.
+COMPLETE_RE = re.compile(r"^COMPLETE\s*[\u2014\u2013-]\s*(.+?)\s*\Z", re.M)
+BARE_COMPLETE_RE = re.compile(r"^COMPLETE[^\w]*\Z", re.I)
 FILE_RE = re.compile(r"^=== FILE:\s*(.+?)\s*$", re.M)   # no closing === on the real files
 
 
@@ -297,20 +307,32 @@ def assistant_texts(msgs):
             for m in msgs if m.get("role") == "ASSISTANT"]
 
 
-def next_followup(text):
-    """The reply states its own next step, e.g. 'INCOMPLETE - continue from scene 04'.
+def terminator(text):
+    """What the reply says about its own output: ('complete'|'incomplete'|None, payload).
 
-    Returns the part after the dash, which is exactly the message the chat expects next.
+    The payload of an incomplete reply is exactly the message the chat expects next
+    ("continue from scene 04"). No terminator at all means the reply was cut off.
     """
     text = (text or "").rstrip()
     if not text:
-        return None
-    m = INCOMPLETE_RE.search(text)
-    if m:
-        return m.group(1).strip()
-    if BARE_INCOMPLETE_RE.search(text.splitlines()[-1]):
-        return "continue"
-    return None
+        return None, ""
+    last = text.splitlines()[-1].strip()
+    for kind, rx in (("incomplete", INCOMPLETE_RE), ("complete", COMPLETE_RE)):
+        m = rx.search(last) or (None if "\n" in last else rx.search(text))
+        if m:
+            return kind, m.group(1).strip()
+    if BARE_INCOMPLETE_RE.search(last):
+        return "incomplete", "continue"
+    if BARE_COMPLETE_RE.match(last):
+        return "complete", ""
+    return None, ""
+
+
+def write_state(outdir, **kw):
+    """A one-line answer to "is it still going?" for whoever watches the run from outside."""
+    kw["at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    outdir.mkdir(parents=True, exist_ok=True)
+    (outdir / "state.json").write_text(json.dumps(kw, ensure_ascii=False, indent=2) + "\n")
 
 
 def strip_fence(block):
@@ -453,11 +475,20 @@ def main():
         pending = assistant_pending(msgs0)
         baseline = len(assistant_texts(msgs0)) - (1 if pending else 0)
         say(f"resuming {sid}: {len(assistant_texts(msgs0))} replies, answer in flight: {pending}")
+        last = (assistant_texts(msgs0) or [""])[-1]
         if pending:
             skip_send = True          # the reply is still coming; wait for it, then follow up
         else:
-            last = (assistant_texts(msgs0) or [""])[-1]
-            prompt = prompt or next_followup(last) or "continue"
+            kind, payload = terminator(last)
+            if kind == "complete" and not prompt:
+                # a pure hand-off resume: the chat settled on a COMPLETE line, so there is nothing
+                # to send. With an explicit DS_PROMPT, that prompt is a new stage for this same
+                # chat, and the previous stage's COMPLETE line says nothing about it.
+                say(f"resume: the reply already ends with {last.splitlines()[-1].strip()!r}; nothing to do")
+                write_state(outdir, chat=sid, state="complete", parts=[])
+                return 0
+            prompt = prompt or (payload if kind == "incomplete" else "continue")
+            say(f"resume: last reply was {kind or 'cut off'}; next prompt {prompt[:60]!r}")
     else:
         pass
 
@@ -499,15 +530,31 @@ def main():
                stall_after=float(env("DS_STALL_AFTER", "45")),
                stable_s=float(env("DS_STABLE_S", "4")))
     max_rounds = int(env("DS_FOLLOWUPS", "60"))
+    total_wait = float(env("DS_TOTAL_WAIT", "21600"))
+    continue_prompt = env("DS_CONTINUE_PROMPT", "continue")
+    deadline_all = time.time() + total_wait
+    written_all = set()
+    state = "running"
 
     rnd = 0
     msgs = []
-    prompt = prompt or "continue"       # an attachment-only run still needs a send
+    prompt = prompt or continue_prompt   # an attachment-only run still needs a send
     while True:
         rnd += 1
+        if rnd > max_rounds:
+            state = "rounds"
+            say(f"follow-up limit ({max_rounds}) reached; stopping")
+            break
+        if time.time() > deadline_all:
+            state = "timeout"
+            say(f"overall budget {total_wait:.0f}s reached with no COMPLETE line; stopping")
+            break
         if skip_send:
             skip_send = False
             say(f"round {rnd}: waiting for the reply already in flight")
+        elif msgs and assistant_pending(msgs):
+            # the previous reply is still streaming: a new prompt would collide with it
+            say(f"round {rnd}: reply still streaming, waiting instead of sending")
         else:
             say(f"round {rnd}: sending {prompt[:70]!r}")
             send_prompt(prompt)
@@ -523,28 +570,41 @@ def main():
         msgs = wait_for_answer(sid, baseline, cfg)
         if not msgs:
             raise SystemExit("no transcript returned")
-        baseline = len(assistant_texts(msgs))
+        pending = assistant_pending(msgs)
+        baseline = len(assistant_texts(msgs)) - (1 if pending else 0)
         save_run(sid, msgs, outdir)
         written = save_file_blocks(msgs, savedir)
         if written:
             say(f"round {rnd}: saved {len(written)} file(s) ->", savedir)
+        written_all |= {p.name for p in savedir.glob("*")}
+        write_state(outdir, chat=sid, round=rnd, state="waiting" if pending else "running",
+                    parts=sorted(written_all))
 
         texts = assistant_texts(msgs)
-        nxt = next_followup(texts[-1]) if texts else None
-        if not nxt:
-            say("reply is complete; nothing to follow up")
+        kind, payload = terminator(texts[-1]) if texts else (None, "")
+        if kind == "complete":
+            state = "complete"
+            say(f"output complete after {rnd} round(s): {texts[-1].splitlines()[-1].strip()!r}")
             break
-        if rnd > max_rounds:
-            say(f"follow-up limit ({max_rounds}) reached; stopping")
-            break
-        prompt = nxt
-        say(f"auto follow-up: {nxt!r}")
+        if pending:
+            # it is still writing: keep waiting on the same reply, send nothing
+            prompt = continue_prompt
+            continue
+        if kind == "incomplete":
+            prompt = payload or continue_prompt
+            say(f"auto follow-up: {prompt!r}")
+        else:
+            prompt = continue_prompt
+            say("reply ended without a COMPLETE line; asking it to continue")
 
     d = save_run(sid, msgs, outdir)
-    say(f"done after {rnd} round(s)")
+    write_state(outdir, chat=sid, round=rnd, state=state, parts=sorted(written_all))
+    say(f"done after {rnd} round(s): {state}")
     say("chat id:", sid)
     say("transcript:", d / "transcript.md")
     say("files:", savedir)
+    if state == "timeout":
+        raise SystemExit(2)
 # browser-harness execs this file inside its own module, so __name__ is never
 # "__main__" here. Use an explicit opt-out so tests can import without running a chat.
 if os.environ.get("DS_IMPORT_ONLY") != "1":
