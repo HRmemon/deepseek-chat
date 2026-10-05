@@ -339,8 +339,11 @@ def strip_fence(block):
     lines = block.strip("\n").split("\n")
     if lines and lines[0].lstrip().startswith("```"):
         lines = lines[1:]
-    if lines and lines[-1].strip().startswith("```"):
-        lines = lines[:-1]
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].strip().startswith("```"):
+            # a closing fence ends the file; the terminator line and any prose come after it
+            lines = lines[:i]
+            break
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
@@ -348,6 +351,83 @@ def parse_file_blocks(text):
     parts = FILE_RE.split(text or "")
     return [(parts[i].strip(), strip_fence(parts[i + 1]))
             for i in range(1, len(parts) - 1, 2)]
+
+
+def attachment_state(names):
+    """Only composer upload cards, never old attachments in conversation messages."""
+    return js(f"""(() => {{
+      const names = {json.dumps(names)};
+      const cards = [...document.querySelectorAll('.cd314545')]
+        .filter(e => !e.closest('.ds-message'));
+      const items = names.map(name => {{
+        const matches = cards.filter(e => e.querySelector('.e70accd6')?.textContent.trim() === name);
+        const e = matches[0];
+        const text = e ? (e.innerText || '') : '';
+        const box = node => {{ if (!node) return null; const r=node.getBoundingClientRect();
+          return {{x:r.x+r.width/2,y:r.y+r.height/2}}; }};
+        return {{name, count:matches.length, text,
+          failed:/server busy|failed|error|try again/i.test(text),
+          pending:/uploading|processing|parsing|reading|queued/i.test(text),
+          retry:box(e?.querySelector('._21072a6')),
+          remove:box(e?.querySelector('._8402d8c'))}};
+      }});
+      const send = [...document.querySelectorAll('div,button')].find(e =>
+        /ds-button--primary/.test(String(e.className)) && !/--disabled/.test(String(e.className)));
+      return {{items, sendEnabled:!!send}};
+    }})()""")
+
+
+def attachments_ready(state):
+    return bool(state and state['sendEnabled'] and state['items'] and all(
+        i['count'] == 1 and not i['failed'] and not i['pending'] for i in state['items']))
+
+
+def ensure_attachments(paths, prompt):
+    """Bounded upload retry; never send a prompt with missing/failed attachments."""
+    names = [pathlib.Path(p).name for p in paths]
+    if len(set(names)) != len(names):
+        raise ValueError('attachment basenames must be unique')
+    state = attachment_state(names)
+    missing = [p for p,i in zip(paths,state['items']) if not i['count']]
+    if missing:
+        upload_file('input[type=file]', missing if len(missing)>1 else missing[0])
+    set_composer(prompt or 'Read the attached files and follow the brief.')
+    deadline = time.time() + float(env('DS_UPLOAD_WAIT','180'))
+    tries = 0
+    next_retry = time.time() + 3
+    while time.time() < deadline:
+        state = attachment_state(names)
+        if attachments_ready(state):
+            say('attachments ready:', ', '.join(names))
+            return prompt
+        failed = [i for i in state['items'] if i['failed']]
+        if failed and tries < 3 and time.time() >= next_retry:
+            for item in failed:
+                if item['retry']:
+                    click_at_xy(item['retry']['x'], item['retry']['y'])
+            tries += 1
+            say(f'upload retry {tries}/3:', ', '.join(i['name'] for i in failed))
+            next_retry = time.time() + (10,20,40)[tries-1]
+        if failed and tries == 3 and time.time() >= next_retry:
+            break
+        wait(2)
+    # Small local text can be supplied intact in the composer instead. Never extract
+    # or silently drop a PDF/image; larger inputs stop with a visible blocker.
+    text_suffixes = {'.md','.txt','.json','.css','.html'}
+    if all(pathlib.Path(p).suffix.lower() in text_suffixes for p in paths):
+        chunks = [f'\n\n=== INPUT: {pathlib.Path(p).name} ===\n'+pathlib.Path(p).read_text() for p in paths]
+        combined = (prompt or '') + ''.join(chunks)
+        if len(combined.encode()) <= 8000:
+            for item in attachment_state(names)['items']:
+                if item['remove']:
+                    click_at_xy(item['remove']['x'], item['remove']['y'])
+            wait(.5)
+            if any(i['count'] for i in attachment_state(names)['items']):
+                raise RuntimeError('failed upload card could not be removed')
+            say('upload unavailable; using complete small text inputs in composer')
+            return combined
+    raise RuntimeError('attachment upload not ready after retries: '+', '.join(
+        i['name']+': '+i['text'] for i in state['items']))
 
 
 def parse_attach(value):
@@ -381,7 +461,12 @@ def send_prompt(text):
     if not js("document.querySelector('textarea').value.length"):
         raise RuntimeError("prompt did not land in the composer")
     if not click_send():
-        click_text(r"send", timeout=3)
+        raise RuntimeError('send disabled: prompt was NOT sent (check attachment readiness)')
+    for _ in range(30):
+        if not js("document.querySelector('textarea')?.value"):
+            return
+        wait(.5)
+    raise RuntimeError('send not acknowledged: composer did not clear')
 
 
 def wait_for_answer(sid, baseline, cfg):
@@ -519,9 +604,8 @@ def main():
         missing = [p for p in paths if not os.path.exists(p)]
         if missing:
             raise SystemExit("attachment not found: " + ", ".join(missing))
-        upload_file("input[type=file]", paths if len(paths) > 1 else paths[0])
-        wait(3.0)
-        say("attached:", ", ".join(pathlib.Path(p).name for p in paths))
+        prompt = ensure_attachments(paths, prompt)
+        say("inputs supplied:", ", ".join(pathlib.Path(p).name for p in paths))
 
     js(OBSERVER_JS)   # watch the reply text, so "complete" needs API and DOM to agree
     # 4. hands-off rounds: send, wait, save files, then obey the reply's own

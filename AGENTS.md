@@ -76,7 +76,14 @@ Output per run: `chat_id.txt`, `transcript.json`, `transcript.md`, plus extracte
   `HTMLTextAreaElement.prototype.value` setter plus a bubbling `input` event.
 - **Send**: `div.ds-button--primary` (not a `<button>`); disabled shows `ds-button--disabled`.
   It is disabled whenever the composer is empty, so it is *not* a "still generating" signal.
-- **Attach**: hidden `input[type=file]` via `upload_file()`.
+- **Attach**: hidden `input[type=file]` via `upload_file()`. Do not assume upload success after a fixed sleep.
+  `ensure_attachments()` checks composer-only cards and Send readiness, retries the upload icon for
+  Server busy/failed cards with bounded backoff, and never sends before all expected inputs are ready.
+  `DS_UPLOAD_WAIT` defaults to 180 seconds. After retry exhaustion, complete text inputs totaling
+  at most 8000 UTF-8 bytes may be pasted intact after removing their failed cards; PDFs/images or
+  larger text fail explicitly. No input is silently dropped. `send_prompt()` verifies the composer
+  clears after clicking enabled Send; a disabled button means NOT sent.
+  Checks: `python3 test_upload_gate.py` and `python3 test_stall_gate.py`.
 - **Chat id**: URL becomes `/a/chat/s/<uuid>` right after send.
 - **Transcript** (the thing visible in DevTools → Network):
   `GET /api/v0/chat/history_messages?chat_session_id=<id>`, header

@@ -28,15 +28,16 @@ for marker, expected in [
     ("INCOMPLETE - continue from scene 33", "continue from scene 33"),
     ("INCOMPLETE \u2014 continue from scene 72", "continue from scene 72"),
 ]:
-    assert ds.next_followup(f"```\ncode\n```\n\n{marker}") == expected
-assert ds.next_followup("```\ncode\n```\n\nAll 72 scenes complete.") is None
-assert ds.next_followup("") is None
-assert ds.next_followup(None) is None
+    assert ds.terminator(f"```\ncode\n```\n\n{marker}") == ('incomplete', expected)
+assert ds.terminator("```\ncode\n```\n\nAll 72 scenes complete.")[0] is None
+assert ds.terminator("")[0] is None
+assert ds.terminator(None)[0] is None
 # a bare marker still asks to be continued
-assert ds.next_followup("some text\n\nINCOMPLETE") == "continue"
+assert ds.terminator("some text\n\nINCOMPLETE")[0] == 'incomplete'
+assert ds.terminator("COMPLETE — 72 files") == ('complete', '72 files')
 # the word appearing earlier in a code comment must not trigger a follow-up
-assert ds.next_followup("# INCOMPLETE handling\nprint(1)\n") is None
-assert ds.next_followup("INCOMPLETE - continue from scene 04\nprint(1)\n") is None
+assert ds.terminator("# INCOMPLETE handling\nprint(1)\n")[0] is None
+assert ds.terminator("INCOMPLETE - continue from scene 04\nprint(1)\n")[0] is None
 
 # --- file blocks -------------------------------------------------------------
 SAMPLE = (
