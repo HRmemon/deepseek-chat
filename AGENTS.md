@@ -79,6 +79,10 @@ Output per run: `chat_id.txt`, `transcript.json`, `transcript.md`, plus extracte
 - **Attach**: hidden `input[type=file]` via `upload_file()`. Do not assume upload success after a fixed sleep.
   `ensure_attachments()` checks composer-only cards and Send readiness, retries the upload icon for
   Server busy/failed cards with bounded backoff, and never sends before all expected inputs are ready.
+  The retry target is the reload SVG inside the composer attachment card (`._21072a6 svg`),
+  not the card background or its remove control. Resolve the icon's live bounding box; restrict
+  matching to the expected filename outside `.ds-message` so old conversation cards cannot win.
+  Clicking the exact icon may still return Server busy: that is not proof that the click missed.
   `DS_UPLOAD_WAIT` defaults to 180 seconds. After retry exhaustion, complete text inputs totaling
   at most 8000 UTF-8 bytes may be pasted intact after removing their failed cards; PDFs/images or
   larger text fail explicitly. No input is silently dropped. `send_prompt()` verifies the composer
