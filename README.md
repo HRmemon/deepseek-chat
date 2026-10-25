@@ -60,10 +60,23 @@ Each run writes `chat_id.txt`, `transcript.json` (raw API) and `transcript.md`
 `DS_SAVE_DIR`. Extraction uses the basename only — reply text is not allowed to choose a
 write path.
 
+## Conversation length limit
+
+A live conversation/context-length notice or matching API error stops the run immediately,
+not after repeated Continue/Retry clicks. Partial transcript/files are saved, `state.json`
+records `state: context_limit` and `recovery: fresh_chat_with_full_inputs`, and `errors.jsonl`
+records the evidence. Exit code is 3. This is not a rate-limit backoff.
+
+A caller may start a fresh chat with the full brief/current files. Do not replay only
+`continue`: the new chat lacks the old context. The explainer-pipeline repair stage performs
+one bounded fresh-chat retry automatically. The generic chat runner stops safely rather than
+inventing missing task inputs. AGENTS.md is never updated automatically.
+
 ## Check
 
 ```bash
 python3 test_stall_gate.py     # offline, no browser, no network
+python3 test_context_limit.py  # stop, preserve partial files, log recovery
 ```
 
 ## Status

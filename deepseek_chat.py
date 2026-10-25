@@ -34,7 +34,17 @@ import time
 RATE_RE = re.compile(
     r"too frequent|too many|rate.?limit|try again later|please wait|"
     r"\u7e41\u7406|\u592a\u9891\u7e41|\u7a0d\u540e", re.I)
+CONTEXT_LIMIT_RE = re.compile(
+    r"(?:conversation|chat|context).{0,100}(?:length|limit|maximum|too long)|"
+    r"(?:length|context) limit (?:reached|exceeded)|maximum (?:conversation|context) length|"
+    r"(?:对话|会话).{0,40}(?:上限|过长)|上下文.{0,40}(?:上限|过长)", re.I)
 CONTINUE_RE = r"^(continue|retry|try again|regenerate|resume)$"
+
+
+class ContextLimit(RuntimeError):
+    def __init__(self, sid, messages, evidence):
+        super().__init__('chat context limit reached; fresh chat with full inputs required')
+        self.sid, self.messages, self.evidence = sid, messages, evidence
 # DeepSeek marks a cut-off reply in its own text, e.g. "INCOMPLETE - continue from scene 04".
 # That line is the next instruction, so the loop needs no model to decide what to do.
 # Anchored to a line start and the end of the reply, so a code comment that merely mentions
@@ -118,6 +128,27 @@ ALERT_TEXT = """(() => {
 
 def alert_text():
     return js(ALERT_TEXT) or ""
+
+
+def context_limit_evidence(api_error=None):
+    if api_error and CONTEXT_LIMIT_RE.search(str(api_error)):
+        return str(api_error)
+    # Short visible UI notices only, never old assistant/user conversation text.
+    notice = js("""(() => {
+      for (const e of document.querySelectorAll('[role=alert],[role=dialog],div,p,span')) {
+        if (e.closest('.ds-message,textarea')) continue;
+        const t = (e.innerText || '').trim();
+        if (!t || t.length > 300 || !e.getClientRects().length) continue;
+        let visible = true;
+        for (let p=e; p; p=p.parentElement) {
+          const s=getComputedStyle(p);
+          if(s.display==='none'||s.visibility==='hidden'||Number(s.opacity)===0) {visible=false;break;}
+        }
+        if (visible && /(?:conversation|chat|context).{0,100}(?:length|limit|maximum|too long)|(?:length|context) limit (?:reached|exceeded)|maximum (?:conversation|context) length|(?:对话|会话).{0,40}(?:上限|过长)|上下文.{0,40}(?:上限|过长)/i.test(t)) return t;
+      }
+      return '';
+    })()""") or ''
+    return notice if CONTEXT_LIMIT_RE.search(notice) else None
 
 
 def rate_limited():
@@ -483,6 +514,9 @@ def wait_for_answer(sid, baseline, cfg):
     msgs = []
     while time.time() - started < cfg["max_wait"]:
         msgs, err = summarize(history(sid))
+        limit = context_limit_evidence(err)
+        if limit:
+            raise ContextLimit(sid, msgs, limit)
         sig = json.dumps(msgs, sort_keys=True)
         if sig != last_sig:
             last_sig, last_progress = sig, time.time()
@@ -557,6 +591,9 @@ def main():
         if not sid:
             raise SystemExit("resume: the open tab is not a deepseek chat")
         msgs0, _err = summarize(history(sid))
+        limit = context_limit_evidence(_err)
+        if limit:
+            raise ContextLimit(sid, msgs0, limit)
         pending = assistant_pending(msgs0)
         baseline = len(assistant_texts(msgs0)) - (1 if pending else 0)
         say(f"resuming {sid}: {len(assistant_texts(msgs0))} replies, answer in flight: {pending}")
@@ -691,5 +728,25 @@ def main():
         raise SystemExit(2)
 # browser-harness execs this file inside its own module, so __name__ is never
 # "__main__" here. Use an explicit opt-out so tests can import without running a chat.
+def record_context_limit(error):
+    outdir = pathlib.Path(env('DS_OUTDIR', str(pathlib.Path.cwd() / 'runs')))
+    savedir = pathlib.Path(env('DS_SAVE_DIR', str(outdir / 'files')))
+    outdir.mkdir(parents=True, exist_ok=True)
+    save_run(error.sid, error.messages, outdir)
+    save_file_blocks(error.messages, savedir)
+    row = dict(at=time.strftime('%Y-%m-%dT%H:%M:%S'), event='context_limit',
+               chat=error.sid, evidence=error.evidence, recovery='fresh_chat_with_full_inputs')
+    with (outdir/'errors.jsonl').open('a') as f:
+        f.write(json.dumps(row, ensure_ascii=False)+'\n')
+    write_state(outdir, chat=error.sid, state='context_limit',
+                error=error.evidence, recovery='fresh_chat_with_full_inputs',
+                parts=sorted(p.name for p in savedir.glob('*')))
+    say('context_limit: partial output saved; do not continue this chat')
+
+
 if os.environ.get("DS_IMPORT_ONLY") != "1":
-    main()
+    try:
+        main()
+    except ContextLimit as error:
+        record_context_limit(error)
+        raise SystemExit(3)
